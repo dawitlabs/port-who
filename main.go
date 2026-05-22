@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -70,6 +71,39 @@ func scanTCP(path string, port int) []int64 {
 		inodes = append(inodes, inode)
 	}
 	return inodes
+}
+
+type portEntry struct {
+	port  int
+	inode int64
+}
+
+func scanAllTCP(path string) []portEntry {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var entries []portEntry
+	sc := bufio.NewScanner(f)
+	sc.Scan() // skip header
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 10 || fields[3] != "0A" {
+			continue
+		}
+		p, err := parseHexPort(fields[1])
+		if err != nil {
+			continue
+		}
+		inode, err := strconv.ParseInt(fields[9], 10, 64)
+		if err != nil {
+			continue
+		}
+		entries = append(entries, portEntry{p, inode})
+	}
+	return entries
 }
 
 func inodeToPID(inode int64) int {
@@ -164,14 +198,62 @@ func fmtDur(d time.Duration) string {
 	}
 }
 
+func listAll() {
+	var all []portEntry
+	seen := map[int]bool{}
+	for _, e := range scanAllTCP("/proc/net/tcp") {
+		if !seen[e.port] {
+			seen[e.port] = true
+			all = append(all, e)
+		}
+	}
+	for _, e := range scanAllTCP("/proc/net/tcp6") {
+		if !seen[e.port] {
+			seen[e.port] = true
+			all = append(all, e)
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].port < all[j].port })
+
+	fmt.Printf("\n%s╔══════════════════════════════════════════╗%s\n", cyan, reset)
+	fmt.Printf("%s║%s  %sport-who%s  ·  listening ports           %s║%s\n", cyan, reset, bold, reset, cyan, reset)
+	fmt.Printf("%s╚══════════════════════════════════════════╝%s\n\n", cyan, reset)
+	fmt.Printf("  %s%-7s  %-20s  %-8s  %s%s\n", bold, "PORT", "PROCESS", "PID", "UPTIME", reset)
+	fmt.Println("  " + strings.Repeat("─", 50))
+
+	for _, e := range all {
+		pid := inodeToPID(e.inode)
+		if pid < 0 {
+			fmt.Printf("  %s:%-6d%s  %s%-20s  %-8s  %s%s\n",
+				yellow, e.port, reset, dim, "(no access — try sudo)", "", "", reset)
+			continue
+		}
+		p := getProc(pid)
+		name := p.name
+		if len(name) > 20 {
+			name = name[:19] + "…"
+		}
+		uptime := ""
+		if p.uptime > 0 {
+			uptime = fmtDur(p.uptime)
+		}
+		fmt.Printf("  %s:%-6d%s  %-20s  %s%-8d%s  %s\n",
+			yellow, e.port, reset, name, dim, pid, reset, uptime)
+	}
+	fmt.Printf("\n  %sport-who <port>%s  for details  ·  %sport-who --kill <port>%s  to terminate\n\n",
+		dim, reset, dim, reset)
+}
+
 func main() {
 	kill := flag.Bool("kill", false, "send SIGTERM to the process using this port")
 	flag.Parse()
 
+	// No argument: list all listening ports
 	if flag.NArg() == 0 {
-		fmt.Fprintln(os.Stderr, "usage: port-who [--kill] <port>")
-		os.Exit(1)
+		listAll()
+		return
 	}
+
 	port, err := strconv.Atoi(flag.Arg(0))
 	if err != nil || port < 1 || port > 65535 {
 		fmt.Fprintf(os.Stderr, "invalid port: %s\n", flag.Arg(0))
